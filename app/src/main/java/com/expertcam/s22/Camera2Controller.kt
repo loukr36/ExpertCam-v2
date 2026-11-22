@@ -16,6 +16,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
@@ -43,6 +44,8 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -233,12 +236,47 @@ class VideoRecorderHelper(private val context: Context) {
 }
 
 /**
- * Contrôleur Camera2 anti-crash pour Samsung Galaxy S22+ :
- * - Interdiction stricte d'appeler setPhysicalCameraId() (évite erreur -38).
- * - Ouverture en cascade : ID caché dédié d'abord, puis repli sur "0" avec UNE seule surface active,
- *   stabilisation désactivée (OIS/EIS OFF) et zoom >= 1.0f.
- * - Photo garantie via ImageReader JPEG ou capture haute qualité du TextureView en repli.
- * - Ratio d'image corrigé par matrice TextureView.setTransform sans déformation.
+ * Sélectionne une résolution native exacte dans SCALER_STREAM_CONFIGURATION_MAP du capteur physique
+ * (ex: 1920x1080 ou 1440x1080) afin d'éviter l'erreur CamX -38 liée à une taille d'écran non native.
+ */
+fun pickExactPhysicalPreviewSize(
+    cameraManager: CameraManager,
+    targetId: String,
+    fallbackChars: CameraCharacteristics
+): Size {
+    val chars = try {
+        cameraManager.getCameraCharacteristics(targetId)
+    } catch (_: Exception) {
+        fallbackChars
+    }
+    val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        ?: fallbackChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+    val sizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: return Size(1920, 1080)
+
+    val preferredOrder = listOf(
+        Size(1920, 1080),
+        Size(1440, 1080),
+        Size(1280, 960),
+        Size(1280, 720)
+    )
+    for (pref in preferredOrder) {
+        if (sizes.any { it.width == pref.width && it.height == pref.height }) {
+            return pref
+        }
+    }
+    return sizes
+        .filter { it.width <= 1920 && it.height <= 1440 }
+        .maxByOrNull { it.width.toLong() * it.height.toLong() }
+        ?: sizes.minByOrNull { abs((it.width.toFloat() / it.height.toFloat()) - (4f / 3f)) }
+        ?: Size(1920, 1080)
+}
+
+/**
+ * Contrôleur Camera2 avancé Qualcomm CamX / Samsung pour Galaxy S22+ (Android 16) :
+ * - Méthode A : ID=0 + setPhysicalCameraId("5"/"6") + taille physique native + sessionParameters.
+ * - Méthode B : ID=0 sans setPhysicalCameraId + sessionParameters pré-verrouillé sur 1.0f / 3.0f.
+ * - Méthode C : ID=0 + setPhysicalCameraId("5"/"6") + modes d'opération Samsung (0x8008, 0x8001, 0x800C, 0x8004).
+ * - Bascule automatique garantie sur la caméra frontale (ID=1) si Android 16 refuse toutes les méthodes sur ID=0.
  */
 class Camera2Controller(
     private val context: Context,
@@ -248,7 +286,18 @@ class Camera2Controller(
 ) {
     companion object {
         private const val TAG = "Camera2Controller"
+        val SAMSUNG_VENDOR_OP_MODES = listOf(0x8008, 0x8001, 0x800C, 0x8004)
     }
+
+    private data class RearOpenAttempt(
+        val label: String,
+        val openCameraId: String,
+        val physicalCameraId: String?,
+        val operationMode: Int,
+        val initialZoomRatio: Float,
+        val useSessionParameters: Boolean,
+        val lensType: SafeLensType
+    )
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val videoRecorder = VideoRecorderHelper(context)
@@ -265,16 +314,21 @@ class Camera2Controller(
     private var previewSurfaceRef: Surface? = null
     private var jpegImageReader: ImageReader? = null
 
-    private var currentCandidate: CameraCandidate? = null
-    private var currentChars: CameraCharacteristics? = null
+    private var currentAttempt: RearOpenAttempt? = null
+    private var currentLogicalChars: CameraCharacteristics? = null
+    private var currentPhysicalChars: CameraCharacteristics? = null
     private var previewSize: Size = Size(1920, 1080)
     private var sensorOrientation: Int = 90
 
-    // Liste en cascade pour l'objectif courant
-    private var candidateQueue: List<CameraCandidate> = emptyList()
-    private var candidateIndex: Int = 0
-    private var usingSingleSurfaceFallback: Boolean = false
+    private var attemptQueue: List<RearOpenAttempt> = emptyList()
+    private var attemptIndex: Int = 0
+    private val winningAttemptByLens = mutableMapOf<SafeLensType, RearOpenAttempt>()
+    private val attemptGeneration = AtomicInteger(0)
+    private val attemptReceivedFrame = AtomicBoolean(false)
+    private var watchdogRunnable: Runnable? = null
+
     private var isPausedOrClosed: Boolean = false
+    private var useSingleSurfaceMode: Boolean = false
 
     private val _uiState = MutableStateFlow(
         CameraUiState(
@@ -286,11 +340,12 @@ class Camera2Controller(
 
     private fun startBackgroundThread() {
         if (backgroundThread != null) return
-        backgroundThread = HandlerThread("ExpertCam2MainBg").also { it.start() }
+        backgroundThread = HandlerThread("ExpertCam2CamXBg").also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
     }
 
     private fun stopBackgroundThread() {
+        cancelWatchdog()
         backgroundThread?.quitSafely()
         try {
             backgroundThread?.join(1000)
@@ -328,16 +383,18 @@ class Camera2Controller(
         if (textureView?.isAvailable != true) return
         startBackgroundThread()
 
-        val list = scanner.getCandidatesFor(requestedLens)
-            .filter { it.cameraId !in scanner.brokenUwIds }
-
-        if (list.isEmpty()) {
-            postError("Aucun capteur disponible pour ${requestedLens.zoomLabel}")
+        val queue = buildAttemptQueue(requestedLens)
+        if (queue.isEmpty()) {
+            if (requestedLens != SafeLensType.FRONT && scanner.hasFrontAvailable()) {
+                fallbackToFrontCamera("Aucun capteur arrière sain — bascule sur Selfie (ID 1)")
+            } else {
+                postError("Aucun capteur caméra disponible")
+            }
             return
         }
 
-        candidateQueue = list
-        candidateIndex = 0
+        attemptQueue = queue
+        attemptIndex = 0
         _uiState.update {
             it.copy(
                 activeLens = requestedLens,
@@ -348,115 +405,273 @@ class Camera2Controller(
                 errorBanner = null
             )
         }
-        tryOpenCurrentCandidate()
+        tryExecuteCurrentAttempt()
+    }
+
+    private fun buildAttemptQueue(lens: SafeLensType): List<RearOpenAttempt> {
+        if (lens == SafeLensType.FRONT) {
+            val frontId = scanner.getCandidatesFor(SafeLensType.FRONT).firstOrNull()?.cameraId ?: "1"
+            return listOf(
+                RearOpenAttempt(
+                    label = "Front ID $frontId",
+                    openCameraId = frontId,
+                    physicalCameraId = null,
+                    operationMode = SessionConfiguration.SESSION_REGULAR,
+                    initialZoomRatio = 1.0f,
+                    useSessionParameters = false,
+                    lensType = SafeLensType.FRONT
+                )
+            )
+        }
+
+        val logicalBackId = scanner.allCameras
+            .firstOrNull { it.id == "0" && it.facing == CameraCharacteristics.LENS_FACING_BACK }?.id
+            ?: scanner.allCameras
+                .firstOrNull { it.facing == CameraCharacteristics.LENS_FACING_BACK && it.isInCameraIdList && it.id !in scanner.brokenUwIds }?.id
+            ?: "0"
+
+        val widePhysId = scanner.allCameras
+            .firstOrNull { it.role == SensorRole.WIDE_1X && it.id != logicalBackId && it.id !in scanner.brokenUwIds }?.id
+            ?: "5"
+
+        val telePhysId = scanner.allCameras
+            .firstOrNull { it.role == SensorRole.TELE_3X && it.id != logicalBackId && it.id !in scanner.brokenUwIds }?.id
+            ?: "6"
+
+        val targetPhysId = if (lens == SafeLensType.TELE) telePhysId else widePhysId
+        val targetZoom = if (lens == SafeLensType.TELE) 3.0f else 1.0f
+
+        val list = mutableListOf<RearOpenAttempt>()
+
+        // Priorité immédiate à la méthode qui a déjà réussi pour cet objectif
+        winningAttemptByLens[lens]?.let { list.add(it) }
+
+        // Méthode A : ID=0 + setPhysicalCameraId("5"/"6") + taille physique native + sessionParameters
+        list.add(
+            RearOpenAttempt(
+                label = "Méthode A (ID $logicalBackId + phys $targetPhysId)",
+                openCameraId = logicalBackId,
+                physicalCameraId = targetPhysId,
+                operationMode = SessionConfiguration.SESSION_REGULAR,
+                initialZoomRatio = targetZoom,
+                useSessionParameters = true,
+                lensType = lens
+            )
+        )
+
+        // Méthode B : ID=0 sans setPhysicalCameraId + sessionParameters pré-verrouillé sur 1.0f ou 3.0f
+        list.add(
+            RearOpenAttempt(
+                label = "Méthode B (ID $logicalBackId zoom=${targetZoom}x)",
+                openCameraId = logicalBackId,
+                physicalCameraId = null,
+                operationMode = SessionConfiguration.SESSION_REGULAR,
+                initialZoomRatio = targetZoom,
+                useSessionParameters = true,
+                lensType = lens
+            )
+        )
+
+        // Méthode C : ID=0 + setPhysicalCameraId("5"/"6") + modes d'opération Samsung vendor
+        for (opMode in SAMSUNG_VENDOR_OP_MODES) {
+            val hex = "0x${opMode.toString(16).uppercase(Locale.US)}"
+            list.add(
+                RearOpenAttempt(
+                    label = "Méthode C ($hex phys=$targetPhysId)",
+                    openCameraId = logicalBackId,
+                    physicalCameraId = targetPhysId,
+                    operationMode = opMode,
+                    initialZoomRatio = targetZoom,
+                    useSessionParameters = true,
+                    lensType = lens
+                )
+            )
+        }
+
+        return list.distinctBy {
+            "${it.openCameraId}_${it.physicalCameraId}_${it.operationMode}_${it.initialZoomRatio}_${it.useSessionParameters}"
+        }
     }
 
     @SuppressLint("MissingPermission")
-    private fun tryOpenCurrentCandidate() {
+    private fun tryExecuteCurrentAttempt() {
         if (isPausedOrClosed || textureView?.isAvailable != true) return
-        val candidate = candidateQueue.getOrNull(candidateIndex) ?: run {
-            postError("Échec ouverture ${uiState.value.activeLens.zoomLabel} : tous les candidats ont échoué")
+        val attempt = attemptQueue.getOrNull(attemptIndex) ?: run {
+            if (_uiState.value.activeLens != SafeLensType.FRONT && scanner.hasFrontAvailable()) {
+                fallbackToFrontCamera(
+                    "Capteurs arrière bloqués sur ID 0 (Android 16) — bascule auto sur Selfie (ID 1)"
+                )
+            } else {
+                postError("Aucune méthode caméra n'a réussi")
+            }
             return
         }
 
-        // Sécurité absolue : ne jamais ouvrir un ID banni 0.6x en mode principal
-        if (candidate.cameraId in scanner.brokenUwIds) {
-            advanceCascade("ID ${candidate.cameraId} banni (0.6x)")
+        // Ne jamais ouvrir ni cibler le capteur 0.6x cassé (ID 2) en mode principal
+        if (attempt.openCameraId in scanner.brokenUwIds ||
+            (attempt.physicalCameraId != null && attempt.physicalCameraId in scanner.brokenUwIds)
+        ) {
+            advanceAttempt("Capteur 0.6x banni ignoré", attemptGeneration.get())
             return
         }
 
-        val chars = scanner.getCharacteristics(candidate.cameraId) ?: run {
-            advanceCascade("Caractéristiques introuvables pour ID ${candidate.cameraId}")
+        val logicalChars = scanner.getCharacteristics(attempt.openCameraId) ?: run {
+            advanceAttempt("Caractéristiques introuvables pour ID ${attempt.openCameraId}", attemptGeneration.get())
             return
         }
+        val physChars = if (attempt.physicalCameraId != null) {
+            scanner.getCharacteristics(attempt.physicalCameraId) ?: logicalChars
+        } else {
+            logicalChars
+        }
 
+        val gen = attemptGeneration.incrementAndGet()
+        attemptReceivedFrame.set(false)
+        cancelWatchdog()
         closeCameraInternal()
 
-        currentCandidate = candidate
-        currentChars = chars
-        usingSingleSurfaceFallback = candidate.isFallbackLogicalZero
-        sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        currentAttempt = attempt
+        currentLogicalChars = logicalChars
+        currentPhysicalChars = physChars
+        sensorOrientation = physChars.get(CameraCharacteristics.SENSOR_ORIENTATION)
+            ?: logicalChars.get(CameraCharacteristics.SENSOR_ORIENTATION)
+            ?: 90
 
-        prepareStreamsForCandidate(chars, attachJpegReader = !usingSingleSurfaceFallback)
+        // En mode arrière (ID=0), surface unique prioritaire pour ne pas saturer CamX ;
+        // en mode Selfie (ID=1), ImageReader JPEG est attaché directement.
+        useSingleSurfaceMode = attempt.lensType != SafeLensType.FRONT
+        prepareStreamsForAttempt(attempt, logicalChars, physChars)
 
-        _uiState.update { it.copy(activeCameraId = candidate.cameraId) }
+        _uiState.update {
+            it.copy(
+                activeCameraId = if (attempt.physicalCameraId != null) {
+                    "${attempt.openCameraId}->${attempt.physicalCameraId}"
+                } else {
+                    attempt.openCameraId
+                }
+            )
+        }
+
+        // Watchdog 2.5s sur les tentatives arrière pour ne jamais rester bloqué sur écran noir
+        if (attempt.lensType != SafeLensType.FRONT) {
+            scheduleAttemptWatchdog(gen, attempt)
+        }
 
         try {
             if (!openCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
                 throw RuntimeException("Timeout verrou Camera2")
             }
             cameraManager.openCamera(
-                candidate.cameraId,
+                attempt.openCameraId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         openCloseLock.release()
-                        if (isPausedOrClosed) {
+                        if (isPausedOrClosed || gen != attemptGeneration.get()) {
                             camera.close()
                             return
                         }
                         cameraDevice = camera
-                        createSessionStandard(videoSurface = null)
+                        createSessionForAttempt(attempt, videoSurface = null, gen = gen)
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
                         openCloseLock.release()
                         camera.close()
                         if (cameraDevice == camera) cameraDevice = null
+                        advanceAttempt("${attempt.label} -> onDisconnected", gen)
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
                         openCloseLock.release()
                         camera.close()
                         if (cameraDevice == camera) cameraDevice = null
-                        advanceCascade("onError #$error (${translateCameraError(error)}) sur ID ${candidate.cameraId}")
+                        advanceAttempt("${attempt.label} -> onError ${translateCameraError(error)}", gen)
                     }
                 },
                 backgroundHandler
             )
-        } catch (e: IllegalArgumentException) {
-            openCloseLock.release()
-            advanceCascade("ID ${candidate.cameraId} refusé (IllegalArgumentException)")
-        } catch (e: SecurityException) {
-            openCloseLock.release()
-            advanceCascade("ID ${candidate.cameraId} bloqué (SecurityException)")
         } catch (e: CameraAccessException) {
             openCloseLock.release()
-            advanceCascade("CameraAccessException #${e.reason} sur ID ${candidate.cameraId}: ${e.message}")
+            advanceAttempt("${attempt.label} -> CameraAccessException #${e.reason}: ${e.message}", gen)
+        } catch (e: SecurityException) {
+            openCloseLock.release()
+            advanceAttempt("${attempt.label} -> SecurityException", gen)
         } catch (e: Exception) {
             openCloseLock.release()
-            advanceCascade("Exception ouverture ID ${candidate.cameraId}: ${e.message}")
+            advanceAttempt("${attempt.label} -> ${e.javaClass.simpleName}: ${e.message}", gen)
         }
     }
 
-    private fun advanceCascade(reason: String) {
-        Log.w(TAG, "Cascade -> échec candidat #$candidateIndex : $reason")
-        if (isPausedOrClosed) return
+    private fun scheduleAttemptWatchdog(gen: Int, attempt: RearOpenAttempt) {
+        cancelWatchdog()
+        val r = Runnable {
+            if (gen == attemptGeneration.get() && !attemptReceivedFrame.get() && !isPausedOrClosed) {
+                advanceAttempt("${attempt.label} -> Timeout 2.5s (0 image)", gen)
+            }
+        }
+        watchdogRunnable = r
+        backgroundHandler?.postDelayed(r, 2500L)
+    }
 
-        val nextIdx = candidateIndex + 1
-        if (nextIdx < candidateQueue.size) {
-            candidateIndex = nextIdx
-            backgroundHandler?.postDelayed({ tryOpenCurrentCandidate() }, 200L)
+    private fun cancelWatchdog() {
+        watchdogRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+        watchdogRunnable = null
+    }
+
+    private fun advanceAttempt(reason: String, gen: Int) {
+        if (gen != attemptGeneration.get() || isPausedOrClosed) return
+        cancelWatchdog()
+        Log.w(TAG, "Cascade CamX échec #$attemptIndex : $reason")
+
+        val next = attemptIndex + 1
+        if (next < attemptQueue.size) {
+            attemptIndex = next
+            backgroundHandler?.postDelayed({ tryExecuteCurrentAttempt() }, 200L)
         } else {
-            postError(reason)
+            // Toutes les méthodes arrière ont échoué sur ID=0 -> bascule automatique sur Selfie (ID=1)
+            if (_uiState.value.activeLens != SafeLensType.FRONT && scanner.hasFrontAvailable()) {
+                fallbackToFrontCamera(
+                    "Arrière bloqué ($reason) — bascule auto sur Selfie (ID 1)"
+                )
+            } else {
+                postError(reason)
+            }
         }
     }
 
-    private fun prepareStreamsForCandidate(
-        chars: CameraCharacteristics,
-        attachJpegReader: Boolean
-    ) {
-        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
+    private fun fallbackToFrontCamera(bannerMessage: String) {
+        Log.i(TAG, "Bascule automatique vers caméra frontale : $bannerMessage")
+        val frontQueue = buildAttemptQueue(SafeLensType.FRONT)
+        attemptQueue = frontQueue
+        attemptIndex = 0
+        _uiState.update {
+            it.copy(
+                activeLens = SafeLensType.FRONT,
+                zoomDisplay = 1.0f,
+                errorBanner = bannerMessage
+            )
+        }
+        backgroundHandler?.postDelayed({ tryExecuteCurrentAttempt() }, 200L)
+    }
 
-        val previewSizes = map.getOutputSizes(SurfaceTexture::class.java) ?: arrayOf(Size(1920, 1080))
-        val tvW = textureView?.width ?: 1080
-        val tvH = textureView?.height ?: 1920
-        previewSize = chooseOptimalPreviewSize(previewSizes, tvW, tvH)
+    private fun prepareStreamsForAttempt(
+        attempt: RearOpenAttempt,
+        logicalChars: CameraCharacteristics,
+        physChars: CameraCharacteristics
+    ) {
+        // Méthode A / C : taille exacte du capteur physique dans son SCALER_STREAM_CONFIGURATION_MAP
+        previewSize = if (attempt.physicalCameraId != null) {
+            pickExactPhysicalPreviewSize(cameraManager, attempt.physicalCameraId, logicalChars)
+        } else {
+            pickExactPhysicalPreviewSize(cameraManager, attempt.openCameraId, logicalChars)
+        }
 
         jpegImageReader?.close()
         jpegImageReader = null
 
-        if (attachJpegReader) {
-            val jpegSizes = map.getOutputSizes(ImageFormat.JPEG) ?: arrayOf(Size(1920, 1080))
+        if (!useSingleSurfaceMode) {
+            val map = physChars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG) ?: arrayOf(Size(1920, 1080))
             val bestJpeg = chooseBestPhotoSize(jpegSizes, previewSize)
             jpegImageReader = ImageReader.newInstance(bestJpeg.width, bestJpeg.height, ImageFormat.JPEG, 2).apply {
                 setOnImageAvailableListener({ reader ->
@@ -471,13 +686,22 @@ class Camera2Controller(
         }
     }
 
-    /**
-     * Crée une session Camera2 avec UNIQUEMENT des OutputConfiguration(surface) standards.
-     * Aucun appel à setPhysicalCameraId().
-     */
-    private fun createSessionStandard(videoSurface: Surface?) {
+    @SuppressLint("WrongConstant")
+    private fun buildSessionConfiguration(
+        operationMode: Int,
+        configs: List<OutputConfiguration>,
+        callback: CameraCaptureSession.StateCallback
+    ): SessionConfiguration {
+        return SessionConfiguration(operationMode, configs, sessionExecutor, callback)
+    }
+
+    private fun createSessionForAttempt(
+        attempt: RearOpenAttempt,
+        videoSurface: Surface?,
+        gen: Int
+    ) {
         val device = cameraDevice ?: return
-        val candidate = currentCandidate ?: return
+        val logicalChars = currentLogicalChars ?: return
         val tv = textureView ?: return
         val st = tv.surfaceTexture ?: return
 
@@ -490,6 +714,7 @@ class Camera2Controller(
             } catch (_: Exception) {}
             captureSession = null
 
+            // Taille exacte native du capteur physique
             st.setDefaultBufferSize(previewSize.width, previewSize.height)
             previewSurfaceRef?.release()
             val previewSurface = Surface(st)
@@ -497,15 +722,19 @@ class Camera2Controller(
 
             val surfaces = mutableListOf<Surface>()
             surfaces.add(previewSurface)
-
             if (videoSurface != null) {
                 surfaces.add(videoSurface)
-            } else if (!usingSingleSurfaceFallback) {
+            } else if (!useSingleSurfaceMode) {
                 jpegImageReader?.surface?.let { surfaces.add(it) }
             }
 
-            // OutputConfiguration standard uniquement — JAMAIS setPhysicalCameraId
-            val configs = surfaces.map { OutputConfiguration(it) }
+            val configs = surfaces.map { s ->
+                OutputConfiguration(s).apply {
+                    if (attempt.physicalCameraId != null) {
+                        setPhysicalCameraId(attempt.physicalCameraId)
+                    }
+                }
+            }
 
             val template = if (videoSurface != null) {
                 CameraDevice.TEMPLATE_RECORD
@@ -523,56 +752,89 @@ class Camera2Controller(
 
             val callback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
-                    if (cameraDevice == null || isPausedOrClosed) {
+                    if (cameraDevice == null || isPausedOrClosed || gen != attemptGeneration.get()) {
                         session.close()
                         return
                     }
                     captureSession = session
-                    applyAutoControls(builder, isLogicalFallback = usingSingleSurfaceFallback)
+                    applyControls(builder, attempt)
                     try {
-                        session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+                        session.setRepeatingRequest(
+                            builder.build(),
+                            object : CameraCaptureSession.CaptureCallback() {
+                                override fun onCaptureCompleted(
+                                    s: CameraCaptureSession,
+                                    request: CaptureRequest,
+                                    result: TotalCaptureResult
+                                ) {
+                                    if (attemptReceivedFrame.compareAndSet(false, true)) {
+                                        cancelWatchdog()
+                                        if (attempt.lensType != SafeLensType.FRONT) {
+                                            winningAttemptByLens[attempt.lensType] = attempt
+                                            Log.i(TAG, "Méthode arrière validée : ${attempt.label}")
+                                        }
+                                    }
+                                }
+                            },
+                            backgroundHandler
+                        )
                         if (videoSurface != null) {
                             videoRecorder.start()
-                            _uiState.update { it.copy(isRecording = true, recordingSeconds = 0L, errorBanner = null) }
-                        } else {
-                            _uiState.update { it.copy(errorBanner = null) }
+                            _uiState.update { it.copy(isRecording = true, recordingSeconds = 0L) }
                         }
                     } catch (e: Exception) {
                         if (videoSurface != null) {
-                            handleVideoStartFailure("Erreur démarrage flux vidéo: ${e.message}")
+                            handleVideoStartFailure("Erreur flux vidéo: ${e.message}")
                         } else {
-                            advanceCascade("setRepeatingRequest échoué sur ID ${candidate.cameraId}: ${e.message}")
+                            advanceAttempt("${attempt.label} -> setRepeatingRequest: ${e.message}", gen)
                         }
                     }
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
                     if (videoSurface != null) {
-                        handleVideoStartFailure("Configuration vidéo refusée sur ID ${candidate.cameraId}")
-                    } else if (!usingSingleSurfaceFallback) {
-                        // Repli immédiat en surface unique (sans ImageReader) sur le même capteur
-                        usingSingleSurfaceFallback = true
-                        jpegImageReader?.close()
-                        jpegImageReader = null
-                        createSessionStandard(videoSurface = null)
+                        handleVideoStartFailure("Configuration vidéo refusée (${attempt.label})")
                     } else {
-                        advanceCascade("onConfigureFailed sur ID ${candidate.cameraId}")
+                        advanceAttempt("${attempt.label} -> onConfigureFailed", gen)
                     }
                 }
             }
 
-            val sessionConfig = SessionConfiguration(
-                SessionConfiguration.SESSION_REGULAR,
-                configs,
-                sessionExecutor,
-                callback
+            val sessionConfig = buildSessionConfiguration(
+                operationMode = attempt.operationMode,
+                configs = configs,
+                callback = callback
             )
+
+            // Méthodes A, B, C : pré-configure sessionParameters AVANT createCaptureSession
+            if (attempt.useSessionParameters) {
+                val initReqBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                    set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                    set(
+                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                    )
+                    set(
+                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                        CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                    )
+                    applySafeZoom(this, logicalChars, attempt.initialZoomRatio)
+                }
+                sessionConfig.setSessionParameters(initReqBuilder.build())
+            }
+
             device.createCaptureSession(sessionConfig)
+        } catch (e: CameraAccessException) {
+            if (videoSurface != null) {
+                handleVideoStartFailure("CameraAccessException vidéo: ${e.message}")
+            } else {
+                advanceAttempt("${attempt.label} -> CameraAccessException #${e.reason}: ${e.message}", gen)
+            }
         } catch (e: Exception) {
             if (videoSurface != null) {
                 handleVideoStartFailure("Exception session vidéo: ${e.message}")
             } else {
-                advanceCascade("Exception session ID ${candidate.cameraId}: ${e.message}")
+                advanceAttempt("${attempt.label} -> ${e.javaClass.simpleName}: ${e.message}", gen)
             }
         }
     }
@@ -588,21 +850,17 @@ class Camera2Controller(
                 errorBanner = if (was4k) "4K non supporté — passage automatique en 1080p" else reason
             )
         }
-        createSessionStandard(videoSurface = null)
+        val attempt = currentAttempt ?: return
+        createSessionForAttempt(attempt, videoSurface = null, gen = attemptGeneration.get())
     }
 
-    private fun applyAutoControls(
-        builder: CaptureRequest.Builder,
-        isLogicalFallback: Boolean
-    ) {
+    private fun applyControls(builder: CaptureRequest.Builder, attempt: RearOpenAttempt) {
         val state = _uiState.value
-        val candidate = currentCandidate ?: return
-        val chars = currentChars ?: return
+        val logicalChars = currentLogicalChars ?: return
 
         builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
 
-        // Exposition + Flash auto
         val aeMode = when (state.flash) {
             FlashOption.AUTO -> CameraMetadata.CONTROL_AE_MODE_ON_AUTO_FLASH
             FlashOption.ON -> CameraMetadata.CONTROL_AE_MODE_ON_ALWAYS_FLASH
@@ -611,7 +869,6 @@ class Camera2Controller(
         builder.set(CaptureRequest.CONTROL_AE_MODE, aeMode)
         builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
 
-        // Autofocus continu automatique
         val afMode = if (state.mode == CameraMode.VIDEO) {
             CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO
         } else {
@@ -619,8 +876,12 @@ class Camera2Controller(
         }
         builder.set(CaptureRequest.CONTROL_AF_MODE, afMode)
 
-        // Stabilisation : strictement OFF en repli logique "0" pour éviter le réveil du 0.6x
-        if (isLogicalFallback) {
+        if (attempt.lensType == SafeLensType.FRONT && state.mode == CameraMode.VIDEO) {
+            builder.set(
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+            )
+        } else {
             builder.set(
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                 CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
@@ -629,21 +890,15 @@ class Camera2Controller(
                 CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
                 CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
             )
-        } else if (state.mode == CameraMode.VIDEO) {
-            builder.set(
-                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
-            )
         }
 
-        // Zoom strictement >= 1.0f en mode caméra principale
-        val requestedZoom = when {
-            candidate.isFallbackLogicalZero -> state.zoomDisplay.coerceAtLeast(candidate.fixedZoomRatio)
-            candidate.lensType == SafeLensType.TELE -> (state.zoomDisplay / 3.0f).coerceAtLeast(1.0f)
-            else -> state.zoomDisplay.coerceAtLeast(1.0f)
+        val safeZoom = when (attempt.lensType) {
+            SafeLensType.WIDE -> state.zoomDisplay.coerceIn(1.0f, 2.9f)
+            SafeLensType.TELE -> state.zoomDisplay.coerceIn(3.0f, 10.0f)
+            SafeLensType.FRONT -> state.zoomDisplay.coerceIn(1.0f, 2.0f)
         }.coerceAtLeast(1.0f)
 
-        applySafeZoom(builder, chars, requestedZoom)
+        applySafeZoom(builder, logicalChars, safeZoom)
     }
 
     private fun applySafeZoom(
@@ -673,9 +928,10 @@ class Camera2Controller(
     private fun refreshRepeating() {
         val session = captureSession ?: return
         val builder = previewBuilder ?: return
+        val attempt = currentAttempt ?: return
         backgroundHandler?.post {
             try {
-                applyAutoControls(builder, isLogicalFallback = usingSingleSurfaceFallback)
+                applyControls(builder, attempt)
                 session.setRepeatingRequest(builder.build(), null, backgroundHandler)
             } catch (e: Exception) {
                 Log.w(TAG, "Erreur refreshRepeating: ${e.message}")
@@ -740,7 +996,7 @@ class Camera2Controller(
     fun tapToFocus(normX: Float, normY: Float) {
         val session = captureSession ?: return
         val builder = previewBuilder ?: return
-        val chars = currentChars ?: return
+        val chars = currentPhysicalChars ?: currentLogicalChars ?: return
         val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return
 
         backgroundHandler?.post {
@@ -775,13 +1031,13 @@ class Camera2Controller(
         val readerSurface = jpegImageReader?.surface
         val device = cameraDevice
         val session = captureSession
+        val attempt = currentAttempt
 
-        // Si ImageReader est actif sur la session, capture JPEG plein capteur
-        if (!usingSingleSurfaceFallback && readerSurface != null && device != null && session != null) {
+        if (!useSingleSurfaceMode && readerSurface != null && device != null && session != null && attempt != null) {
             backgroundHandler?.post {
                 try {
                     val req = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-                    applyAutoControls(req, isLogicalFallback = false)
+                    applyControls(req, attempt)
                     req.addTarget(readerSurface)
                     req.set(CaptureRequest.JPEG_ORIENTATION, getJpegOrientation())
                     req.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
@@ -792,7 +1048,6 @@ class Camera2Controller(
                 }
             }
         } else {
-            // Repli garanti sans reconfigurer la session sur "0"
             captureFromTextureViewFallback()
         }
     }
@@ -816,6 +1071,7 @@ class Camera2Controller(
 
     fun startVideoRecording(hasAudioPermission: Boolean) {
         if (videoRecorder.isRecording) return
+        val attempt = currentAttempt ?: return
         val requestedRes = _uiState.value.videoResolution
         backgroundHandler?.post {
             try {
@@ -842,7 +1098,7 @@ class Camera2Controller(
                         )
                     } else throw e
                 }
-                createSessionStandard(videoSurface = videoSurface)
+                createSessionForAttempt(attempt, videoSurface = videoSurface, gen = attemptGeneration.get())
             } catch (e: Exception) {
                 Log.e(TAG, "Erreur démarrage vidéo", e)
                 videoRecorder.release()
@@ -854,10 +1110,13 @@ class Camera2Controller(
 
     fun stopVideoRecording() {
         if (!videoRecorder.isRecording) return
+        val attempt = currentAttempt
         backgroundHandler?.post {
             val savedUri = videoRecorder.stop()
             _uiState.update { it.copy(isRecording = false, recordingSeconds = 0L) }
-            createSessionStandard(videoSurface = null)
+            if (attempt != null) {
+                createSessionForAttempt(attempt, videoSurface = null, gen = attemptGeneration.get())
+            }
             if (savedUri != null) {
                 val media = CapturedMedia(uri = savedUri, mimeType = "video/mp4", isVideo = true)
                 _uiState.update { it.copy(lastCapturedMedia = media) }
@@ -953,6 +1212,8 @@ class Camera2Controller(
 
     fun closeCamera() {
         isPausedOrClosed = true
+        attemptGeneration.incrementAndGet()
+        cancelWatchdog()
         if (videoRecorder.isRecording) {
             stopVideoRecording()
         }
@@ -992,23 +1253,6 @@ class Camera2Controller(
         return if (isFront) (sensorOrientation + 360) % 360 else sensorOrientation
     }
 
-    /**
-     * Choisit une résolution de prévisualisation proche du ratio de l'écran pour limiter le recadrage.
-     */
-    private fun chooseOptimalPreviewSize(sizes: Array<Size>, viewWidth: Int, viewHeight: Int): Size {
-        val targetLandscapeRatio = if (viewWidth > 0 && viewHeight > 0) {
-            max(viewWidth, viewHeight).toFloat() / minOf(viewWidth, viewHeight).toFloat()
-        } else {
-            4f / 3f
-        }
-        val capped = sizes.filter { it.width <= 1920 && it.height <= 1440 }
-        val pool = if (capped.isNotEmpty()) capped else sizes.toList()
-        return pool.minByOrNull { s ->
-            val r = s.width.toFloat() / s.height.toFloat()
-            abs(r - targetLandscapeRatio) * 10f - (s.width / 10000f)
-        } ?: Size(1920, 1080)
-    }
-
     private fun chooseBestPhotoSize(sizes: Array<Size>, refPreview: Size): Size {
         val refRatio = refPreview.width.toFloat() / refPreview.height.toFloat()
         val matching = sizes.filter {
@@ -1019,17 +1263,12 @@ class Camera2Controller(
         return pool.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: Size(4000, 3000)
     }
 
-    /**
-     * Applique une matrice Center-Crop exacte sur TextureView afin que l'image ne soit jamais
-     * étirée ni écrasée quelles que soient la résolution du capteur et la taille de l'écran.
-     */
     private fun configureTransform(viewWidth: Int, viewHeight: Int) {
         val tv = textureView ?: return
         if (viewWidth <= 0 || viewHeight <= 0) return
 
         val matrix = Matrix()
         val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
-        // En orientation portrait, le buffer capteur paysage (W x H) est pivoté de 90° -> (H x W)
         val isRotated = (sensorOrientation == 90 || sensorOrientation == 270)
         val contentW = if (isRotated) previewSize.height.toFloat() else previewSize.width.toFloat()
         val contentH = if (isRotated) previewSize.width.toFloat() else previewSize.height.toFloat()
