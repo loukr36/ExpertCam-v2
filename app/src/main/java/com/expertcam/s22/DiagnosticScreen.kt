@@ -17,7 +17,6 @@ import android.hardware.camera2.params.SessionConfiguration
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
-import android.util.Size
 import android.view.Surface
 import android.view.TextureView
 import android.widget.Toast
@@ -73,14 +72,19 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 private data class DiagTestOption(
     val key: String,
+    val group: String,
     val label: String,
-    val cameraId: String,
-    val zoomOverride: Float? = null
+    val openCameraId: String,
+    val physicalCameraId: String? = null,
+    val operationMode: Int = SessionConfiguration.SESSION_REGULAR,
+    val zoomOverride: Float? = null,
+    val useSessionParameters: Boolean = false
 )
 
 private data class DiagResult(
@@ -91,9 +95,25 @@ private data class DiagResult(
     val message: String
 )
 
+private class DiagHardwareHolder {
+    @Volatile var device: CameraDevice? = null
+    @Volatile var session: CameraCaptureSession? = null
+    @Volatile var surface: Surface? = null
+}
+
 private val DiagGreen = Color(0xFF34C759)
 private val DiagRedBg = Color(0xFF2D1010)
 private val DiagGreenBg = Color(0xFF102A18)
+
+@SuppressLint("WrongConstant")
+private fun createDiagSessionConfiguration(
+    operationMode: Int,
+    outputs: List<OutputConfiguration>,
+    executor: Executor,
+    callback: CameraCaptureSession.StateCallback
+): SessionConfiguration {
+    return SessionConfiguration(operationMode, outputs, executor, callback)
+}
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -105,6 +125,7 @@ fun DiagnosticScreen(
     val scope = rememberCoroutineScope()
     val cameraManager = remember { context.getSystemService(Context.CAMERA_SERVICE) as CameraManager }
     val sessionExecutor = remember { Executors.newSingleThreadExecutor() }
+    val hw = remember { DiagHardwareHolder() }
 
     val cameras = remember {
         scanner.scanAllCameras()
@@ -112,20 +133,104 @@ fun DiagnosticScreen(
     }
 
     val testOptions = remember(cameras) {
+        val widePhysId = cameras.firstOrNull { it.role == SensorRole.WIDE_1X && it.id != "0" }?.id ?: "5"
+        val telePhysId = cameras.firstOrNull { it.role == SensorRole.TELE_3X && it.id != "0" }?.id ?: "6"
+
         buildList {
-            // Boutons dédiés ID 0 avec zooms 0.6x, 1.0x, 3.0x
-            add(DiagTestOption("id0_06", "ID 0 [0.6x]", "0", 0.6f))
-            add(DiagTestOption("id0_10", "ID 0 [1.0x]", "0", 1.0f))
-            add(DiagTestOption("id0_30", "ID 0 [3.0x]", "0", 3.0f))
-            // Un bouton individuel pour CHAQUE caméra détectée (y compris 0.6x et cachées)
+            // Méthode A : setPhysicalCameraId("5") / ("6") + taille physique native + sessionParameters
+            add(
+                DiagTestOption(
+                    key = "meth_a_phys5",
+                    group = "Méthode A — Phys natif + SessionParams",
+                    label = "A: ID0 + Phys $widePhysId (1.0x)",
+                    openCameraId = "0",
+                    physicalCameraId = widePhysId,
+                    operationMode = SessionConfiguration.SESSION_REGULAR,
+                    zoomOverride = 1.0f,
+                    useSessionParameters = true
+                )
+            )
+            add(
+                DiagTestOption(
+                    key = "meth_a_phys6",
+                    group = "Méthode A — Phys natif + SessionParams",
+                    label = "A: ID0 + Phys $telePhysId (3.0x)",
+                    openCameraId = "0",
+                    physicalCameraId = telePhysId,
+                    operationMode = SessionConfiguration.SESSION_REGULAR,
+                    zoomOverride = 3.0f,
+                    useSessionParameters = true
+                )
+            )
+
+            // Méthode B : ID=0 sans setPhysicalCameraId + sessionParameters pré-verrouillé 3.0x / 1.0x
+            add(
+                DiagTestOption(
+                    key = "meth_b_zoom30",
+                    group = "Méthode B — ID0 SessionParams (sans PhysId)",
+                    label = "B: ID0 [3.0x] SessParam",
+                    openCameraId = "0",
+                    physicalCameraId = null,
+                    operationMode = SessionConfiguration.SESSION_REGULAR,
+                    zoomOverride = 3.0f,
+                    useSessionParameters = true
+                )
+            )
+            add(
+                DiagTestOption(
+                    key = "meth_b_zoom10",
+                    group = "Méthode B — ID0 SessionParams (sans PhysId)",
+                    label = "B: ID0 [1.0x] SessParam",
+                    openCameraId = "0",
+                    physicalCameraId = null,
+                    operationMode = SessionConfiguration.SESSION_REGULAR,
+                    zoomOverride = 1.0f,
+                    useSessionParameters = true
+                )
+            )
+
+            // Méthode C : Modes d'opération Samsung vendor sur ID=0 + setPhysicalCameraId("5")
+            for (opMode in Camera2Controller.SAMSUNG_VENDOR_OP_MODES) {
+                val hex = "0x${opMode.toString(16).uppercase(Locale.US)}"
+                add(
+                    DiagTestOption(
+                        key = "meth_c_${hex}_p$widePhysId",
+                        group = "Méthode C — Modes Samsung Vendor (ID0 + Phys $widePhysId)",
+                        label = "C: $hex (Phys $widePhysId)",
+                        openCameraId = "0",
+                        physicalCameraId = widePhysId,
+                        operationMode = opMode,
+                        zoomOverride = 1.0f,
+                        useSessionParameters = true
+                    )
+                )
+            }
+            add(
+                DiagTestOption(
+                    key = "meth_c_0x8008_p$telePhysId",
+                    group = "Méthode C — Modes Samsung Vendor (ID0 + Phys $widePhysId)",
+                    label = "C: 0x8008 (Phys $telePhysId)",
+                    openCameraId = "0",
+                    physicalCameraId = telePhysId,
+                    operationMode = 0x8008,
+                    zoomOverride = 3.0f,
+                    useSessionParameters = true
+                )
+            )
+
+            // Tests directs individuels de chaque capteur détecté
             cameras.forEach { cam ->
                 val hiddenTag = if (cam.isHidden) " Caché" else ""
                 add(
                     DiagTestOption(
-                        key = "cam_${cam.id}",
+                        key = "direct_${cam.id}",
+                        group = "Tests directs par ID",
                         label = "ID ${cam.id} (${cam.role.label}$hiddenTag)",
-                        cameraId = cam.id,
-                        zoomOverride = null
+                        openCameraId = cam.id,
+                        physicalCameraId = null,
+                        operationMode = SessionConfiguration.SESSION_REGULAR,
+                        zoomOverride = null,
+                        useSessionParameters = false
                     )
                 )
             }
@@ -134,40 +239,39 @@ fun DiagnosticScreen(
 
     val results = remember { mutableStateMapOf<String, DiagResult>() }
     var activeTestLabel by remember { mutableStateOf("Aucun test actif") }
-    var activeStatusMsg by remember { mutableStateOf("Choisissez une caméra ou appuyez sur TOUT TESTER (Auto)") }
+    var activeStatusMsg by remember { mutableStateOf("Appuyez sur une méthode (A, B, C) ou sur TOUT TESTER (Auto)") }
     var activeIsError by remember { mutableStateOf(false) }
     var liveFrameCount by remember { mutableIntStateOf(0) }
     var isRunningAuto by remember { mutableStateOf(false) }
 
     var textureViewRef by remember { mutableStateOf<TextureView?>(null) }
-    var activeDevice by remember { mutableStateOf<CameraDevice?>(null) }
-    var activeSession by remember { mutableStateOf<CameraCaptureSession?>(null) }
-    var activeSurface by remember { mutableStateOf<Surface?>(null) }
     val framesAtomic = remember { AtomicInteger(0) }
+    val testGeneration = remember { AtomicInteger(0) }
     var watchdogJob by remember { mutableStateOf<Job?>(null) }
     var autoJob by remember { mutableStateOf<Job?>(null) }
 
-    val bgThread = remember { HandlerThread("ExpertCamDiagBg").apply { start() } }
+    val bgThread = remember { HandlerThread("ExpertCamDiagCamXBg").apply { start() } }
     val bgHandler = remember { Handler(bgThread.looper) }
 
     fun stopCurrentTest() {
+        testGeneration.incrementAndGet()
         watchdogJob?.cancel()
         watchdogJob = null
         try {
-            activeSession?.stopRepeating()
+            hw.session?.stopRepeating()
         } catch (_: Exception) {}
         try {
-            activeSession?.close()
+            hw.session?.close()
         } catch (_: Exception) {}
-        activeSession = null
+        hw.session = null
         try {
-            activeDevice?.close()
+            hw.device?.close()
         } catch (_: Exception) {}
-        activeDevice = null
+        hw.device = null
         try {
-            activeSurface?.release()
+            hw.surface?.release()
         } catch (_: Exception) {}
-        activeSurface = null
+        hw.surface = null
     }
 
     DisposableEffect(Unit) {
@@ -179,7 +283,8 @@ fun DiagnosticScreen(
         }
     }
 
-    fun recordResult(option: DiagTestOption, success: Boolean, msg: String) {
+    fun recordResult(option: DiagTestOption, gen: Int, success: Boolean, msg: String) {
+        if (gen != testGeneration.get()) return
         if (!success) {
             watchdogJob?.cancel()
             watchdogJob = null
@@ -199,6 +304,7 @@ fun DiagnosticScreen(
     @SuppressLint("MissingPermission")
     fun runSingleTest(option: DiagTestOption) {
         stopCurrentTest()
+        val gen = testGeneration.get()
         results.remove(option.key)
         framesAtomic.set(0)
         liveFrameCount = 0
@@ -209,25 +315,28 @@ fun DiagnosticScreen(
         val tv = textureViewRef
         val st = tv?.surfaceTexture
         if (tv == null || st == null || !tv.isAvailable) {
-            recordResult(option, false, "TextureView non prêt")
+            recordResult(option, gen, false, "TextureView non prêt")
             return
         }
 
         // Watchdog écran noir (3 secondes)
         watchdogJob = scope.launch {
             delay(3000L)
+            if (gen != testGeneration.get()) return@launch
             val currentFrames = framesAtomic.get()
             liveFrameCount = currentFrames
             val existing = results[option.key]
             if (currentFrames == 0 && (existing == null || existing.success)) {
                 recordResult(
                     option,
+                    gen,
                     false,
                     "ÉCRAN NOIR SILENCIEUX : 0 image reçue du capteur"
                 )
             } else if (currentFrames > 0) {
                 recordResult(
                     option,
+                    gen,
                     true,
                     "OK — $currentFrames images reçues en 3s"
                 )
@@ -235,31 +344,46 @@ fun DiagnosticScreen(
         }
 
         try {
-            val chars = cameraManager.getCameraCharacteristics(option.cameraId)
-            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val sizes = map?.getOutputSizes(SurfaceTexture::class.java)
-            val chosenSize = sizes?.firstOrNull { it.width <= 1280 && it.height <= 960 }
-                ?: sizes?.lastOrNull()
-                ?: Size(1280, 720)
+            val logicalChars = cameraManager.getCameraCharacteristics(option.openCameraId)
+            val chosenSize = if (option.physicalCameraId != null) {
+                pickExactPhysicalPreviewSize(cameraManager, option.physicalCameraId, logicalChars)
+            } else {
+                pickExactPhysicalPreviewSize(cameraManager, option.openCameraId, logicalChars)
+            }
+            val opHex = "0x${option.operationMode.toString(16).uppercase(Locale.US)}"
+            val metaTag = "[open=${option.openCameraId}, phys=${option.physicalCameraId ?: "none"}, res=${chosenSize.width}x${chosenSize.height}, op=$opHex, zoom=${option.zoomOverride ?: "def"}]"
 
             cameraManager.openCamera(
-                option.cameraId,
+                option.openCameraId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
-                        activeDevice = camera
+                        if (gen != testGeneration.get()) {
+                            camera.close()
+                            return
+                        }
+                        hw.device = camera
                         try {
                             st.setDefaultBufferSize(chosenSize.width, chosenSize.height)
                             val surface = Surface(st)
-                            activeSurface = surface
-                            // OutputConfiguration standard uniquement — JAMAIS setPhysicalCameraId
-                            val config = OutputConfiguration(surface)
-                            val sessionConfig = SessionConfiguration(
-                                SessionConfiguration.SESSION_REGULAR,
-                                listOf(config),
-                                sessionExecutor,
-                                object : CameraCaptureSession.StateCallback() {
+                            hw.surface = surface
+
+                            val outConfig = OutputConfiguration(surface).apply {
+                                if (option.physicalCameraId != null) {
+                                    setPhysicalCameraId(option.physicalCameraId)
+                                }
+                            }
+
+                            val sessionConfig = createDiagSessionConfiguration(
+                                operationMode = option.operationMode,
+                                outputs = listOf(outConfig),
+                                executor = sessionExecutor,
+                                callback = object : CameraCaptureSession.StateCallback() {
                                     override fun onConfigured(session: CameraCaptureSession) {
-                                        activeSession = session
+                                        if (gen != testGeneration.get()) {
+                                            session.close()
+                                            return
+                                        }
+                                        hw.session = session
                                         try {
                                             val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                                             req.addTarget(surface)
@@ -273,7 +397,7 @@ fun DiagnosticScreen(
                                                 CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
                                             )
                                             if (option.zoomOverride != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                                val zRange = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                                                val zRange = logicalChars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
                                                 val z = if (zRange != null) {
                                                     option.zoomOverride.coerceIn(zRange.lower, zRange.upper)
                                                 } else option.zoomOverride
@@ -281,14 +405,17 @@ fun DiagnosticScreen(
                                             }
                                             session.setRepeatingRequest(req.build(), null, bgHandler)
                                             scope.launch {
-                                                activeStatusMsg = "Flux démarré — attente d'images (watchdog 3s)..."
+                                                if (gen == testGeneration.get()) {
+                                                    activeStatusMsg = "Session OK $metaTag — attente images (3s)..."
+                                                }
                                             }
                                         } catch (e: Exception) {
                                             scope.launch {
                                                 recordResult(
                                                     option,
+                                                    gen,
                                                     false,
-                                                    "Erreur setRepeatingRequest (${e.javaClass.simpleName}): ${e.message}"
+                                                    "setRepeatingRequest $metaTag -> ${e.javaClass.simpleName}: ${e.message}"
                                                 )
                                             }
                                         }
@@ -298,28 +425,54 @@ fun DiagnosticScreen(
                                         scope.launch {
                                             recordResult(
                                                 option,
+                                                gen,
                                                 false,
-                                                "onConfigureFailed : refus de configuration du flux par le pilote Samsung"
+                                                "onConfigureFailed $metaTag : refus du pilote Samsung/CamX"
                                             )
                                         }
                                     }
                                 }
                             )
+
+                            if (option.useSessionParameters) {
+                                val initBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                                    set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                                    set(
+                                        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                        CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                                    )
+                                    set(
+                                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                                        CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+                                    )
+                                    if (option.zoomOverride != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                        val zRange = logicalChars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+                                        val z = if (zRange != null) {
+                                            option.zoomOverride.coerceIn(zRange.lower, zRange.upper)
+                                        } else option.zoomOverride
+                                        set(CaptureRequest.CONTROL_ZOOM_RATIO, z)
+                                    }
+                                }
+                                sessionConfig.setSessionParameters(initBuilder.build())
+                            }
+
                             camera.createCaptureSession(sessionConfig)
                         } catch (e: CameraAccessException) {
                             scope.launch {
                                 recordResult(
                                     option,
+                                    gen,
                                     false,
-                                    "CameraAccessException (#${e.reason}): ${e.message}"
+                                    "CameraAccessException (#${e.reason}) $metaTag : ${e.message}"
                                 )
                             }
                         } catch (e: Exception) {
                             scope.launch {
                                 recordResult(
                                     option,
+                                    gen,
                                     false,
-                                    "${e.javaClass.simpleName}: ${e.message}"
+                                    "${e.javaClass.simpleName} $metaTag : ${e.message}"
                                 )
                             }
                         }
@@ -327,20 +480,21 @@ fun DiagnosticScreen(
 
                     override fun onDisconnected(camera: CameraDevice) {
                         camera.close()
-                        if (activeDevice == camera) activeDevice = null
+                        if (hw.device == camera) hw.device = null
                         scope.launch {
-                            recordResult(option, false, "onDisconnected : caméra déconnectée par le système")
+                            recordResult(option, gen, false, "onDisconnected $metaTag : déconnectée par Android")
                         }
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
                         camera.close()
-                        if (activeDevice == camera) activeDevice = null
+                        if (hw.device == camera) hw.device = null
                         scope.launch {
                             recordResult(
                                 option,
+                                gen,
                                 false,
-                                "onError ${translateCameraError(error)}"
+                                "onError ${translateCameraError(error)} $metaTag"
                             )
                         }
                     }
@@ -348,16 +502,16 @@ fun DiagnosticScreen(
                 bgHandler
             )
         } catch (e: SecurityException) {
-            recordResult(option, false, "SecurityException : ${e.message}")
+            recordResult(option, gen, false, "SecurityException : ${e.message}")
         } catch (e: CameraAccessException) {
-            recordResult(option, false, "CameraAccessException (#${e.reason}) : ${e.message}")
+            recordResult(option, gen, false, "CameraAccessException (#${e.reason}) : ${e.message}")
         } catch (e: Exception) {
-            recordResult(option, false, "${e.javaClass.simpleName} : ${e.message}")
+            recordResult(option, gen, false, "${e.javaClass.simpleName} : ${e.message}")
         }
     }
 
     fun buildFullReport(): String = buildString {
-        appendLine("=== RAPPORT DIAGNOSTIC EXPERTCAM ===")
+        appendLine("=== RAPPORT DIAGNOSTIC EXPERTCAM (CAMX / SAMSUNG) ===")
         appendLine("Appareil : ${Build.MANUFACTURER} ${Build.MODEL} (device=${Build.DEVICE})")
         appendLine("Android : ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
         appendLine()
@@ -390,7 +544,7 @@ fun DiagnosticScreen(
             .navigationBarsPadding()
             .padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
-        // Barre supérieure Diagnostic
+        // Barre supérieure
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -419,16 +573,15 @@ fun DiagnosticScreen(
             }
 
             Text(
-                text = "DIAGNOSTIC S22+",
+                text = "DIAGNOSTIC CAMX S22+",
                 color = ExpertGold,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.ExtraBold
             )
         }
 
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(6.dp))
 
-        // Infos appareil
         Text(
             text = "${Build.MANUFACTURER} ${Build.MODEL} • Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
             color = TextSecondary,
@@ -437,11 +590,11 @@ fun DiagnosticScreen(
 
         Spacer(Modifier.height(8.dp))
 
-        // Aperçu direct du capteur testé + statut en direct
+        // Aperçu direct + statut du test courant
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(150.dp)
+                .height(145.dp)
                 .clip(RoundedCornerShape(12.dp))
                 .background(Color(0xFF141416))
                 .border(
@@ -454,7 +607,7 @@ fun DiagnosticScreen(
         ) {
             Box(
                 modifier = Modifier
-                    .width(108.dp)
+                    .width(104.dp)
                     .fillMaxSize()
                     .clip(RoundedCornerShape(8.dp))
                     .background(OledBlack)
@@ -489,7 +642,7 @@ fun DiagnosticScreen(
                 Text(
                     text = activeTestLabel,
                     color = ExpertGold,
-                    fontSize = 13.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
@@ -501,15 +654,15 @@ fun DiagnosticScreen(
                 Text(
                     text = activeStatusMsg,
                     color = if (activeIsError) RecordRed else Color.White,
-                    fontSize = 11.sp,
-                    lineHeight = 14.sp
+                    fontSize = 10.sp,
+                    lineHeight = 13.sp
                 )
             }
         }
 
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(8.dp))
 
-        // Bouton TOUT TESTER (Auto) — 3,5 secondes par option
+        // Bouton TOUT TESTER (Auto)
         Button(
             onClick = {
                 if (isRunningAuto) {
@@ -523,21 +676,21 @@ fun DiagnosticScreen(
                     autoJob = scope.launch {
                         for (opt in testOptions) {
                             runSingleTest(opt)
+                            val activeGen = testGeneration.get()
                             delay(3500L)
-                            // Clôture le résultat si pas encore enregistré
                             if (results[opt.key] == null) {
                                 val frames = framesAtomic.get()
                                 if (frames > 0) {
-                                    recordResult(opt, true, "OK — $frames images reçues")
+                                    recordResult(opt, activeGen, true, "OK — $frames images reçues")
                                 } else {
-                                    recordResult(opt, false, "ÉCRAN NOIR SILENCIEUX : 0 image reçue du capteur")
+                                    recordResult(opt, activeGen, false, "ÉCRAN NOIR SILENCIEUX : 0 image reçue du capteur")
                                 }
                             }
                             stopCurrentTest()
                             delay(250L)
                         }
                         isRunningAuto = false
-                        activeTestLabel = "Test automatique terminé"
+                        activeTestLabel = "Tous les tests A / B / C terminés"
                         activeIsError = false
                         activeStatusMsg = "Appuyez sur COPIER LE RAPPORT COMPLET en bas."
                     }
@@ -553,7 +706,7 @@ fun DiagnosticScreen(
             Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp))
             Text(
-                text = if (isRunningAuto) "ARRÊTER LE TEST AUTO" else "TOUT TESTER (Auto — 3,5s / capteur)",
+                text = if (isRunningAuto) "ARRÊTER LE TEST AUTO" else "TOUT TESTER (Auto — Méthodes A, B, C + IDs)",
                 fontWeight = FontWeight.Bold,
                 fontSize = 12.sp
             )
@@ -561,7 +714,7 @@ fun DiagnosticScreen(
 
         Spacer(Modifier.height(8.dp))
 
-        // Liste scrollable : Boutons de test individuels + Inventaire + Résultats
+        // Groupes de tests + Inventaire + Journal des résultats
         Column(
             modifier = Modifier
                 .weight(1f)
@@ -569,43 +722,45 @@ fun DiagnosticScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text(
-                text = "Tests manuels (appuyez pour tester)",
-                color = ExpertGold,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold
-            )
-
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                testOptions.forEach { opt ->
-                    val res = results[opt.key]
-                    val bgColor = when {
-                        res == null -> Color(0xFF1C1C1E)
-                        res.success -> DiagGreenBg
-                        else -> DiagRedBg
-                    }
-                    val borderColor = when {
-                        res == null -> Color.White.copy(alpha = 0.2f)
-                        res.success -> DiagGreen
-                        else -> RecordRed
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(bgColor)
-                            .border(1.dp, borderColor, RoundedCornerShape(10.dp))
-                            .clickable(enabled = !isRunningAuto) { runSingleTest(opt) }
-                            .padding(horizontal = 10.dp, vertical = 7.dp)
-                    ) {
-                        Text(
-                            text = opt.label,
-                            color = Color.White,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
+            val grouped = remember(testOptions) { testOptions.groupBy { it.group } }
+            grouped.forEach { (groupTitle, opts) ->
+                Text(
+                    text = groupTitle,
+                    color = ExpertGold,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    opts.forEach { opt ->
+                        val res = results[opt.key]
+                        val bgColor = when {
+                            res == null -> Color(0xFF1C1C1E)
+                            res.success -> DiagGreenBg
+                            else -> DiagRedBg
+                        }
+                        val borderColor = when {
+                            res == null -> Color.White.copy(alpha = 0.2f)
+                            res.success -> DiagGreen
+                            else -> RecordRed
+                        }
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(bgColor)
+                                .border(1.dp, borderColor, RoundedCornerShape(10.dp))
+                                .clickable(enabled = !isRunningAuto) { runSingleTest(opt) }
+                                .padding(horizontal = 10.dp, vertical = 7.dp)
+                        ) {
+                            Text(
+                                text = opt.label,
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
                 }
             }
@@ -619,9 +774,9 @@ fun DiagnosticScreen(
 
             cameras.forEach { cam ->
                 Text(
-                    text = cam.shortBadge() + " | zoom=[${cam.minZoomRatio}..${cam.maxZoomRatio}]",
+                    text = cam.shortBadge() + " | zoom=[${cam.minZoomRatio}..${cam.maxZoomRatio}] | phys=${cam.physicalChildren}",
                     color = if (cam.role == SensorRole.ULTRAWIDE_BROKEN) RecordRed else Color.White,
-                    fontSize = 11.sp,
+                    fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace
                 )
             }
@@ -656,7 +811,7 @@ fun DiagnosticScreen(
                         Text(
                             text = res.message,
                             color = Color.White,
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace
                         )
                     }
@@ -666,7 +821,6 @@ fun DiagnosticScreen(
 
         Spacer(Modifier.height(8.dp))
 
-        // Bouton jaune COPIER LE RAPPORT COMPLET
         Button(
             onClick = {
                 val report = buildFullReport()
